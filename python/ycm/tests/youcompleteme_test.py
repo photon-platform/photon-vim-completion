@@ -25,6 +25,8 @@ from ycm.tests.test_utils import ( ExtendedMock,
                                    VimSign )
 MockVimModule()
 
+import vim
+
 import os
 import sys
 from hamcrest import ( assert_that, contains_exactly, empty, equal_to,
@@ -76,15 +78,14 @@ def YouCompleteMe_UpdateDiagnosticInterface( ycm, post_vim_message, *args ):
       'line_num': 2,
       'column_num': 31
     },
-    # Looks strange but this is really what ycmd is returning.
     'location_extent': {
       'start': {
-        'filepath': '',
+        'filepath': 'buffer',
         'line_num': 2,
         'column_num': 31,
       },
       'end': {
-        'filepath': '',
+        'filepath': 'buffer',
         'line_num': 2,
         'column_num': 32,
       }
@@ -339,7 +340,8 @@ class YouCompleteMeTest( TestCase ):
 
 
   @YouCompleteMeInstance( { 'g:ycm_extra_conf_vim_data': [ 'tempname()' ] } )
-  def test_YouCompleteMe_DebugInfo_ServerRunning( self, ycm ):
+  @patch( 'ycm.vimsupport.VimSupportsPopupWindows', return_value=True )
+  def test_YouCompleteMe_DebugInfo_ServerRunning( self, ycm, *args ):
     dir_of_script = os.path.dirname( os.path.abspath( __file__ ) )
     buf_name = os.path.join( dir_of_script, 'testdata', 'test.cpp' )
     extra_conf = os.path.join( dir_of_script, 'testdata', '.ycm_extra_conf.py' )
@@ -367,7 +369,8 @@ class YouCompleteMeTest( TestCase ):
 
 
   @YouCompleteMeInstance()
-  def test_YouCompleteMe_DebugInfo_ServerNotRunning( self, ycm ):
+  @patch( 'ycm.vimsupport.VimSupportsPopupWindows', return_value=True )
+  def test_YouCompleteMe_DebugInfo_ServerNotRunning( self, ycm, *args ):
     StopServer( ycm )
 
     current_buffer = VimBuffer( 'current_buffer' )
@@ -531,7 +534,7 @@ class YouCompleteMeTest( TestCase ):
     with MockVimBuffers( [ current_buffer ], [ current_buffer ] ):
       with patch( 'ycm.client.base_request._JsonFromFuture',
                   return_value = { 'message': 'some_detailed_diagnostic' } ):
-        ycm.ShowDetailedDiagnostic(),
+        ycm.ShowDetailedDiagnostic( False ),
 
     post_vim_message.assert_has_exact_calls( [
       call( 'some_detailed_diagnostic', warning = False )
@@ -547,7 +550,7 @@ class YouCompleteMeTest( TestCase ):
     with MockVimBuffers( [ current_buffer ], [ current_buffer ] ):
       with patch( 'ycm.client.base_request._JsonFromFuture',
                   side_effect = RuntimeError( 'Some exception' ) ):
-        ycm.ShowDetailedDiagnostic(),
+        ycm.ShowDetailedDiagnostic( False ),
 
     post_vim_message.assert_has_exact_calls( [
       call( 'Some exception', truncate = False )
@@ -586,6 +589,10 @@ class YouCompleteMeTest( TestCase ):
       with patch( 'ycm.client.event_notification.EventNotification.Response',
                   return_value = {} ):
         ycm.ShowDiagnostics()
+        set_location_list_for_window.assert_called_once_with(
+          vim.current.window,
+          [],
+          1 )
 
     post_vim_message.assert_has_exact_calls( [
       call( 'Forcing compilation, this will block Vim until done.',
@@ -593,7 +600,6 @@ class YouCompleteMeTest( TestCase ):
       call( 'Diagnostics refreshed', warning = False ),
       call( 'No warnings or errors detected.', warning = False )
     ] )
-    set_location_list_for_window.assert_called_once_with( 1, [], 1 )
 
 
   @YouCompleteMeInstance( { 'g:ycm_log_level': 'debug',
@@ -617,6 +623,18 @@ class YouCompleteMeTest( TestCase ):
         'filepath': 'buffer',
         'line_num': 19,
         'column_num': 2
+      },
+      'location_extent': {
+        'start': {
+          'filepath': 'buffer',
+          'line_num': 19,
+          'column_num': 2
+        },
+        'end': {
+          'filepath': 'buffer',
+          'line_num': 19,
+          'column_num': 3
+        }
       }
     }
 
@@ -627,20 +645,21 @@ class YouCompleteMeTest( TestCase ):
       with patch( 'ycm.client.event_notification.EventNotification.Response',
                   return_value = [ diagnostic ] ):
         ycm.ShowDiagnostics()
+        set_location_list_for_window.assert_called_once_with(
+          vim.current.window, [ {
+            'bufnr': 3,
+            'lnum': 19,
+            'col': 2,
+            'text': 'error text',
+            'type': 'E',
+            'valid': 1
+          } ], 0 )
 
     post_vim_message.assert_has_exact_calls( [
       call( 'Forcing compilation, this will block Vim until done.',
             warning = False ),
       call( 'Diagnostics refreshed', warning = False )
     ] )
-    set_location_list_for_window.assert_called_once_with( 1, [ {
-        'bufnr': 3,
-        'lnum': 19,
-        'col': 2,
-        'text': 'error text',
-        'type': 'E',
-        'valid': 1
-    } ], 0 )
 
 
   @YouCompleteMeInstance( { 'g:ycm_open_loclist_on_ycm_diags': 1 } )
@@ -665,6 +684,18 @@ class YouCompleteMeTest( TestCase ):
         'filepath': 'buffer',
         'line_num': 19,
         'column_num': 2
+      },
+      'location_extent': {
+        'start': {
+          'filepath': 'buffer',
+          'line_num': 19,
+          'column_num': 2
+        },
+        'end': {
+          'filepath': 'buffer',
+          'line_num': 19,
+          'column_num': 2
+        }
       }
     }
 
@@ -675,20 +706,21 @@ class YouCompleteMeTest( TestCase ):
       with patch( 'ycm.client.event_notification.EventNotification.Response',
                   return_value = [ diagnostic ] ):
         ycm.ShowDiagnostics()
+        set_location_list_for_window.assert_called_once_with(
+          vim.current.window, [ {
+            'bufnr': 3,
+            'lnum': 19,
+            'col': 2,
+            'text': 'error text',
+            'type': 'E',
+            'valid': 1
+          } ], 1 )
 
     post_vim_message.assert_has_exact_calls( [
       call( 'Forcing compilation, this will block Vim until done.',
             warning = False ),
       call( 'Diagnostics refreshed', warning = False )
     ] )
-    set_location_list_for_window.assert_called_once_with( 1, [ {
-        'bufnr': 3,
-        'lnum': 19,
-        'col': 2,
-        'text': 'error text',
-        'type': 'E',
-        'valid': 1
-    } ], 1 )
     open_location_list.assert_called_once_with( focus = True )
 
 
@@ -730,7 +762,7 @@ class YouCompleteMeTest( TestCase ):
     test_utils.VIM_PROPS_FOR_BUFFER[ current_buffer.number ] = [
       VimProp( 'YcmWarningProperty', 3, 5, 3, 7 ),
       VimProp( 'YcmWarningProperty', 3, 3, 3, 9 ),
-      VimProp( 'YcmErrorProperty', 3, 8 )
+      VimProp( 'YcmErrorProperty', 3, 8, 3, 9 )
     ]
 
     with MockVimBuffers( [ current_buffer ], [ current_buffer ] ):
@@ -915,43 +947,43 @@ class YouCompleteMeTest( TestCase ):
                 new_callable = ExtendedMock ) as set_location_list_for_window:
       with MockVimBuffers( buffers, windows ):
         ycm.UpdateWithNewDiagnosticsForFile( '/current', diagnostics )
+        # Ensure we included all the diags though
+        set_location_list_for_window.assert_has_exact_calls( [
+          call( vim.current.window, [
+            {
+              'lnum': 1,
+              'col': 1,
+              'bufnr': 1,
+              'valid': 1,
+              'type': 'E',
+              'text': 'error text in current buffer',
+            },
+            {
+              'lnum': 4,
+              'col': 2,
+              'bufnr': 3,
+              'valid': 1,
+              'type': 'E',
+              'text': 'error text in hidden buffer',
+            },
+            {
+              'lnum': 8,
+              'col': 4,
+              'bufnr': -1, # sic: Our mocked bufnr function actually returns -1,
+                           # even though YCM is passing "create if needed".
+                           # FIXME? we shouldn't do that, and we should pass
+                           # filename instead
+              'valid': 1,
+              'type': 'E',
+              'text': 'error text in buffer not open in Vim'
+            }
+          ], False )
+        ] )
+
 
     # We update the diagnostic on the current cursor position
     post_vim_message.assert_has_exact_calls( [
       call( "error text in current buffer", truncate = True, warning = False ),
-    ] )
-
-    # Ensure we included all the diags though
-    set_location_list_for_window.assert_has_exact_calls( [
-      call( 1, [
-        {
-          'lnum': 1,
-          'col': 1,
-          'bufnr': 1,
-          'valid': 1,
-          'type': 'E',
-          'text': 'error text in current buffer',
-        },
-        {
-          'lnum': 4,
-          'col': 2,
-          'bufnr': 3,
-          'valid': 1,
-          'type': 'E',
-          'text': 'error text in hidden buffer',
-        },
-        {
-          'lnum': 8,
-          'col': 4,
-          'bufnr': -1, # sic: Our mocked bufnr function actually returns -1,
-                       # even though YCM is passing "create if needed".
-                       # FIXME? we shouldn't do that, and we should pass
-                       # filename instead
-          'valid': 1,
-          'type': 'E',
-          'text': 'error text in buffer not open in Vim'
-        }
-      ], False )
     ] )
 
     assert_that(
@@ -1110,34 +1142,35 @@ class YouCompleteMeTest( TestCase ):
         for filename, diagnostics in diagnostics_per_file:
           ycm.UpdateWithNewDiagnosticsForFile( filename, diagnostics )
 
+        # Ensure we included all the diags though
+        set_location_list_for_window.assert_has_exact_calls( [
+          call( vim.windows[ 0 ], [
+            {
+              'lnum': 1,
+              'col': 1,
+              'bufnr': 1,
+              'valid': 1,
+              'type': 'E',
+              'text': 'error text in current buffer',
+            },
+          ], False ),
+
+          call( vim.windows[ 2 ], [
+            {
+              'lnum': 3,
+              'col': 3,
+              'bufnr': 3,
+              'valid': 1,
+              'type': 'E',
+              'text': 'error text in a buffer open in a separate window',
+            },
+          ], False )
+        ] )
+
+
     # We update the diagnostic on the current cursor position
     post_vim_message.assert_has_exact_calls( [
       call( "error text in current buffer", truncate = True, warning = False ),
-    ] )
-
-    # Ensure we included all the diags though
-    set_location_list_for_window.assert_has_exact_calls( [
-      call( 1, [
-        {
-          'lnum': 1,
-          'col': 1,
-          'bufnr': 1,
-          'valid': 1,
-          'type': 'E',
-          'text': 'error text in current buffer',
-        },
-      ], False ),
-
-      call( 3, [
-        {
-          'lnum': 3,
-          'col': 3,
-          'bufnr': 3,
-          'valid': 1,
-          'type': 'E',
-          'text': 'error text in a buffer open in a separate window',
-        },
-      ], False )
     ] )
 
     assert_that(

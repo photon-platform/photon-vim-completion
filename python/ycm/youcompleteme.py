@@ -1,4 +1,4 @@
-# Copyright (C) 2011-2018 YouCompleteMe contributors
+# Copyright (C) 2011-2024 YouCompleteMe contributors
 #
 # This file is part of YouCompleteMe.
 #
@@ -29,12 +29,14 @@ from ycmd import utils
 from ycmd.request_wrap import RequestWrap
 from ycm.omni_completer import OmniCompleter
 from ycm import syntax_parse
+from ycm.hierarchy_tree import HierarchyTree
 from ycm.client.ycmd_keepalive import YcmdKeepalive
 from ycm.client.base_request import BaseRequest, BuildRequestData
 from ycm.client.completer_available_request import SendCompleterAvailableRequest
 from ycm.client.command_request import ( SendCommandRequest,
                                          SendCommandRequestAsync,
-                                         GetCommandResponse )
+                                         GetCommandResponse,
+                                         GetRawCommandResponse )
 from ycm.client.completion_request import CompletionRequest
 from ycm.client.resolve_completion_request import ResolveCompletionItem
 from ycm.client.signature_help_request import ( SignatureHelpRequest,
@@ -83,9 +85,10 @@ CORE_MISSING_MESSAGE = (
 CORE_OUTDATED_MESSAGE = (
   'YCM core library too old; PLEASE RECOMPILE by running the install.py '
   'script. See the documentation for more details.' )
-NO_PYTHON2_SUPPORT_MESSAGE = (
-  'YCM has dropped support for python2. '
-  'You need to recompile it with python3 instead.' )
+PYTHON_TOO_OLD_MESSAGE = (
+  'Your python is too old to run YCM server. '
+  'Please see troubleshooting guide on YCM GitHub wiki.'
+)
 SERVER_IDLE_SUICIDE_SECONDS = 1800  # 30 minutes
 CLIENT_LOGFILE_FORMAT = 'ycm_'
 SERVER_LOGFILE_FORMAT = 'ycmd_{port}_{std}_'
@@ -107,6 +110,58 @@ class YouCompleteMe:
     self._SetUpLogging()
     self._SetUpServer()
     self._ycmd_keepalive.Start()
+    self._current_hierarchy = HierarchyTree()
+
+
+  def InitializeCurrentHierarchy( self, items, kind ):
+    return self._current_hierarchy.SetRootNode( items, kind )
+
+
+  def UpdateCurrentHierarchy( self, handle : int, direction : str ):
+    if not self._current_hierarchy.UpdateChangesRoot( handle, direction ):
+      items = self._ResolveHierarchyItem( handle, direction )
+      self._current_hierarchy.UpdateHierarchy( handle, items, direction )
+
+      if items is not None and direction == 'up':
+        offset = sum( len( item[ 'locations' ] ) for item in items )
+      else:
+        offset = 0
+
+      return self._current_hierarchy.HierarchyToLines(), offset
+    else:
+      location = self._current_hierarchy.HandleToRootLocation( handle )
+      kind = self._current_hierarchy._kind
+      self._current_hierarchy.Reset()
+      items = GetRawCommandResponse(
+        [ f'{ kind.title() }Hierarchy' ],
+        silent = False,
+        location = location
+      )
+      # [ 0 ] chooses the data for the 1st (and only) line.
+      # [ 1 ] chooses only the handle
+      handle = self.InitializeCurrentHierarchy( items, kind )[ 0 ][ 1 ]
+      return self.UpdateCurrentHierarchy( handle, direction )
+
+
+  def _ResolveHierarchyItem( self, handle : int, direction : str ):
+    return GetRawCommandResponse(
+      self._current_hierarchy.ResolveArguments( handle, direction ),
+      silent = False
+    )
+
+
+  def ShouldResolveItem( self, handle : int, direction : str ):
+    return self._current_hierarchy.ShouldResolveItem( handle, direction )
+
+
+  def ResetCurrentHierarchy( self ):
+    self._current_hierarchy.Reset()
+
+
+  def JumpToHierarchyItem( self, handle ):
+    self._current_hierarchy.JumpToItem(
+        handle,
+        self._user_options[ 'goto_buffer_command' ] )
 
 
   def _SetUpServer( self ):
@@ -119,7 +174,8 @@ class YouCompleteMe:
     self._latest_completion_request = None
     self._latest_signature_help_request = None
     self._signature_help_available_requests = SigHelpAvailableByFileType()
-    self._latest_command_reqeust = None
+    self._command_requests = {}
+    self._next_command_request_id = 0
 
     self._signature_help_state = signature_help.SignatureHelpState()
     self._user_options = base.GetUserOptions( self._default_options )
@@ -249,7 +305,8 @@ class YouCompleteMe:
     elif return_code == 7:
       error_message = CORE_OUTDATED_MESSAGE
     elif return_code == 8:
-      error_message = NO_PYTHON2_SUPPORT_MESSAGE
+      # TODO: here we could retry but discard g:ycm_server_python_interpreter
+      error_message = PYTHON_TOO_OLD_MESSAGE
     else:
       error_message = EXIT_CODE_UNEXPECTED_MESSAGE.format( code = return_code,
                                                            logfile = logfile )
@@ -336,7 +393,9 @@ class YouCompleteMe:
         return False
 
       request_data = self._latest_completion_request.request_data.copy()
-      request_data[ 'signature_help_state' ] = self._signature_help_state.state
+      request_data[ 'signature_help_state' ] = (
+          self._signature_help_state.IsActive()
+      )
 
       self._AddExtraConfDataIfNeeded( request_data )
 
@@ -373,21 +432,24 @@ class YouCompleteMe:
                                    has_range,
                                    start_line,
                                    end_line ):
-    final_arguments = []
-    for argument in arguments:
-      # The ft= option which specifies the completer when running a command is
-      # ignored because it has not been working for a long time. The option is
-      # still parsed to not break users that rely on it.
-      if argument.startswith( 'ft=' ):
-        continue
-      final_arguments.append( argument )
-
     extra_data = {
       'options': {
         'tab_size': vimsupport.GetIntValue( 'shiftwidth()' ),
         'insert_spaces': vimsupport.GetBoolValue( '&expandtab' )
       }
     }
+
+    final_arguments = []
+    for argument in arguments:
+      if argument.startswith( 'ft=' ):
+        extra_data[ 'completer_target' ] = argument[ 3: ]
+        continue
+      elif argument.startswith( '--bufnr=' ):
+        extra_data[ 'bufnr' ] = int( argument[ len( '--bufnr=' ): ] )
+        continue
+
+      final_arguments.append( argument )
+
     if has_range:
       extra_data.update( vimsupport.BuildRange( start_line, end_line ) )
     self._AddExtraConfDataIfNeeded( extra_data )
@@ -423,18 +485,32 @@ class YouCompleteMe:
     return GetCommandResponse( final_arguments, extra_data )
 
 
-  def SendCommandRequestAsync( self, arguments ):
+  def SendCommandRequestAsync( self,
+                               arguments,
+                               silent = True,
+                               location = None ):
     final_arguments, extra_data = self._GetCommandRequestArguments(
       arguments,
       False,
       0,
       0 )
-    self._latest_command_reqeust = SendCommandRequestAsync( final_arguments,
-                                                            extra_data )
+
+    request_id = self._next_command_request_id
+    self._next_command_request_id += 1
+    self._command_requests[ request_id ] = SendCommandRequestAsync(
+      final_arguments,
+      extra_data,
+      silent,
+      location = location )
+    return request_id
 
 
-  def GetCommandRequest( self ):
-    return self._latest_command_reqeust
+  def GetCommandRequest( self, request_id ):
+    return self._command_requests.get( request_id )
+
+
+  def FlushCommandRequest( self, request_id ):
+    self._command_requests.pop( request_id, None )
 
 
   def GetDefinedSubcommands( self ):
@@ -584,12 +660,23 @@ class YouCompleteMe:
 
 
   def CurrentBuffer( self ):
-    return self._buffers[ vimsupport.GetCurrentBufferNumber() ]
+    return self.Buffer( vimsupport.GetCurrentBufferNumber() )
+
+
+  def Buffer( self, bufnr ):
+    return self._buffers[ bufnr ]
+
+
+  def OnInsertEnter( self ):
+    if not self._user_options[ 'update_diagnostics_in_insert_mode' ]:
+      self.CurrentBuffer().ClearDiagnosticsUI()
 
 
   def OnInsertLeave( self ):
+    async_diags = any( self._message_poll_requests.get( filetype )
+                      for filetype in vimsupport.CurrentFiletypes() )
     if ( not self._user_options[ 'update_diagnostics_in_insert_mode' ] and
-         not self.NeedsReparse() ):
+         ( async_diags or not self.CurrentBuffer().ParseRequestPending() ) ):
       self.CurrentBuffer().RefreshDiagnosticsUI()
     SendEventNotificationAsync( 'InsertLeave' )
 
@@ -717,6 +804,12 @@ class YouCompleteMe:
       debug_info += ( 'Server logfiles:\n'
                       f'  { self._server_stdout }\n'
                       f'  { self._server_stderr }' )
+    debug_info += ( '\nSemantic highlighting supported: ' +
+                    str( not vimsupport.VimIsNeovim() ) )
+    debug_info += ( '\nVirtual text supported: ' +
+                    str( not vimsupport.VimIsNeovim() ) )
+    debug_info += ( '\nPopup windows supported: ' +
+                    str( vimsupport.VimSupportsPopupWindows() ) )
     return debug_info
 
 
@@ -795,13 +888,50 @@ class YouCompleteMe:
       self._CloseLogfile( logfile )
 
 
-  def ShowDetailedDiagnostic( self ):
+  def ShowDetailedDiagnostic( self, message_in_popup ):
     detailed_diagnostic = BaseRequest().PostDataToHandler(
         BuildRequestData(), 'detailed_diagnostic' )
-
     if detailed_diagnostic and 'message' in detailed_diagnostic:
-      vimsupport.PostVimMessage( detailed_diagnostic[ 'message' ],
-                                 warning = False )
+      message = detailed_diagnostic[ 'message' ]
+      if message_in_popup and vimsupport.VimSupportsPopupWindows():
+        window = vim.current.window
+        buffer_number = vimsupport.GetCurrentBufferNumber()
+        diags_on_this_line = self._buffers[ buffer_number ].DiagnosticsForLine(
+            window.cursor[ 0 ] )
+
+        lines = message.split( '\n' )
+        available_columns = vimsupport.GetIntValue( '&columns' )
+        col = window.cursor[ 1 ] + 1
+        if col > available_columns - 2: # -2 accounts for padding.
+          col = 0
+        options = {
+          'col': col,
+          'padding': [ 0, 1, 0, 1 ],
+          'maxwidth': available_columns,
+          'close': 'click',
+          'fixed': 0,
+          'highlight': 'YcmErrorPopup',
+          'border': [ 1, 1, 1, 1 ],
+          # Close when moving cursor
+          'moved': 'expr',
+        }
+        popup_func = 'popup_atcursor'
+        for diag in diags_on_this_line:
+          if message == diag[ 'text' ]:
+            popup_func = 'popup_create'
+            prop = vimsupport.GetTextPropertyForDiag( buffer_number,
+                                                      window.cursor[ 0 ],
+                                                      diag )
+            options.update( {
+              'textpropid': prop[ 'id' ],
+              'textprop': prop[ 'type' ],
+            } )
+            options.pop( 'col' )
+            break
+        vim.eval( f'{ popup_func }( { json.dumps( lines ) }, '
+                                  f'{ json.dumps( options ) } )' )
+      else:
+        vimsupport.PostVimMessage( message, warning = False )
 
 
   def ForceCompileAndDiagnostics( self ):
@@ -845,6 +975,10 @@ class YouCompleteMe:
     }, 'filter_and_sort_candidates' )
 
 
+  def ToggleSignatureHelp( self ):
+    self._signature_help_state.ToggleVisibility()
+
+
   def _AddSyntaxDataIfNeeded( self, extra_data ):
     if not self._user_options[ 'seed_identifiers_with_syntax' ]:
       return
@@ -861,7 +995,8 @@ class YouCompleteMe:
   def _AddTagsFilesIfNeeded( self, extra_data ):
     def GetTagFiles():
       tag_files = vim.eval( 'tagfiles()' )
-      return [ os.path.join( utils.GetCurrentDirectory(), tag_file )
+      return [ ( os.path.join( utils.GetCurrentDirectory(), tag_file )
+                 if not os.path.isabs( tag_file ) else tag_file )
                for tag_file in tag_files ]
 
     if not self._user_options[ 'collect_identifiers_from_tags_files' ]:

@@ -148,8 +148,8 @@ def GetUnsavedAndSpecifiedBufferData( included_buffer, included_filepath ):
 def GetBufferNumberForFilename( filename, create_buffer_if_needed = False ):
   realpath = os.path.realpath( filename )
   return MADEUP_FILENAME_TO_BUFFER_NUMBER.get( realpath, GetIntValue(
-      f"bufnr('{ EscapeForVim( realpath ) }', "
-             f"{ int( create_buffer_if_needed ) })" ) )
+      f"bufnr( '{ EscapeForVim( realpath ) }', "
+             f"{ int( create_buffer_if_needed ) } )" ) )
 
 
 def GetCurrentBufferFilepath():
@@ -159,7 +159,7 @@ def GetCurrentBufferFilepath():
 def BufferIsVisible( buffer_number ):
   if buffer_number < 0:
     return False
-  window_number = GetIntValue( f"bufwinnr({ buffer_number })" )
+  window_number = GetIntValue( f"bufwinnr( { buffer_number } )" )
   return window_number != -1
 
 
@@ -178,16 +178,84 @@ def GetCurrentBufferNumber():
 
 
 def GetBufferChangedTick( bufnr ):
-  return GetIntValue( f'getbufvar({ bufnr }, "changedtick")' )
+  try:
+    return GetIntValue( f'getbufvar({ bufnr }, "changedtick")' )
+  except ValueError:
+    # For some reason, occasionally changedtick returns '' and causes an error.
+    # In that case, just return 0 rather than spamming an error to the console.
+    return 0
+
+
+# Returns a range covering the earliest and latest lines visible in the current
+# tab page for the supplied buffer number. By default this range is then
+# extended by half of the resulting range size
+def RangeVisibleInBuffer( bufnr, grow_factor=0.5 ):
+  windows = [ w for w in vim.eval( f'win_findbuf( { bufnr } )' )
+              if GetIntValue( vim.eval( f'win_id2tabwin( { w } )[ 0 ]' ) ) ==
+                vim.current.tabpage.number ]
+
+  class Location:
+    line: int = None
+    col: int = None
+
+  class Range:
+    start: Location = Location()
+    end: Location = Location()
+
+  try:
+    buffer = vim.buffers[ bufnr ]
+  except KeyError:
+    return None
+
+  if not windows:
+    return None
+
+  r = Range()
+  # Note, for this we ignore horizontal scrolling
+  for winid in windows:
+    win_info = vim.eval( f'getwininfo( { winid } )[ 0 ]' )
+    if r.start.line is None or r.start.line > int( win_info[ 'topline' ] ):
+      r.start.line = int( win_info[ 'topline' ] )
+    if r.end.line is None or r.end.line < int( win_info[ 'botline' ] ):
+      r.end.line = int( win_info[ 'botline' ] )
+
+  # Extend the range by 1 factor, and calculate the columns
+  num_lines = r.end.line - r.start.line + 1
+  r.start.line = max( r.start.line - int( num_lines * grow_factor ), 1 )
+  r.start.col = 1
+  r.end.line = min( r.end.line + int( num_lines * grow_factor ), len( buffer ) )
+  r.end.col = len( buffer[ r.end.line - 1 ] )
+
+  filepath = GetBufferFilepath( buffer )
+  return {
+    'start': {
+      'line_num': r.start.line,
+      'column_num': r.start.col,
+      'filepath': filepath,
+    },
+    'end': {
+      'line_num': r.end.line,
+      'column_num': r.end.col,
+      'filepath': filepath,
+    }
+  }
+
+
+def VisibleRangeOfBufferOverlaps( bufnr, expanded_range ):
+  visible_range = RangeVisibleInBuffer( bufnr, 0 )
+  # As above, we ignore horizontal scroll and only check lines
+  return (
+    expanded_range is not None and
+    visible_range is not None and
+    visible_range[ 'start' ][ 'line_num' ]
+      >= expanded_range[ 'start' ][ 'line_num' ] and
+    visible_range[ 'end' ][ 'line_num' ]
+      <= expanded_range[ 'end' ][ 'line_num' ]
+  )
 
 
 def CaptureVimCommand( command ):
-  vim.command( 'redir => b:ycm_command' )
-  vim.command( f'silent! { command }' )
-  vim.command( 'redir END' )
-  output = ToUnicode( vim.eval( 'b:ycm_command' ) )
-  vim.command( 'unlet b:ycm_command' )
-  return output
+  return vim.eval( f"execute( '{ EscapeForVim( command ) }', 'silent!' )" )
 
 
 def GetSignsInBuffer( buffer_number ):
@@ -208,37 +276,58 @@ class DiagnosticProperty( namedtuple( 'DiagnosticProperty', [ 'id',
              self.length == other.length )
 
 
+def GetTextPropertyForDiag( buffer_number, line_number, diag ):
+  range = diag[ 'location_extent' ]
+  start = range[ 'start' ]
+  end = range[ 'end' ]
+  start_line = start[ 'line_num' ]
+  end_line = end[ 'line_num' ]
+  if start_line == end_line:
+    length = end[ 'column_num' ] - start[ 'column_num' ]
+    column = start[ 'column_num' ]
+  elif start_line == line_number:
+    # -1 switches to 0-based indexing.
+    current_line_len = len( vim.buffers[ buffer_number ][ line_number - 1 ] )
+    # +2 includes the start columnand accounts for properties at the end of line
+    # covering \n as well.
+    length = current_line_len - start[ 'column_num' ] + 2
+    column = start[ 'column_num' ]
+  elif end_line == line_number:
+    length = end[ 'column_num' ] - 1
+    column = 1
+  else:
+    # -1 switches to 0-based indexing.
+    # +1 accounts for properties at the end of line covering \n as well.
+    length = len( vim.buffers[ buffer_number ][ line_number - 1 ] ) + 1
+    column = 1
+  if diag[ 'kind' ] == 'ERROR':
+    property_name = 'YcmErrorProperty'
+  else:
+    property_name = 'YcmWarningProperty'
+  vim_props = vim.eval( f'prop_list( { line_number }, '
+                        f'{{ "bufnr": { buffer_number }, '
+                           f'"types": [ "{ property_name }" ] }} )' )
+  return next( filter(
+      lambda p: column == int( p[ 'col' ] ) and
+                length == int( p[ 'length' ] ),
+      vim_props ) )
+
+
 def GetTextProperties( buffer_number ):
   if not VimIsNeovim():
-    if HasFastPropList():
-      return [
-        DiagnosticProperty(
-            int( p[ 'id' ] ),
-            p[ 'type' ],
-            int( p[ 'lnum' ] ),
-            int( p[ 'col' ] ),
-            int( p[ 'length' ] ) )
-        for p in vim.eval(
-            f'prop_list( 1, '
-                         f'{{ "bufnr": { buffer_number }, '
-                             '"end_lnum": -1, '
-                             '"types": [ "YcmErrorProperty", '
-                                        '"YcmWarningProperty" ] } )' ) ]
-    else:
-      properties = []
-      for line_number in range( len( vim.buffers[ buffer_number ] ) ):
-        vim_props =  vim.eval( f'prop_list( {line_number + 1}, '
-                               f'{{ "bufnr": { buffer_number } }} )' )
-        properties.extend(
-          DiagnosticProperty(
-            int( p[ 'id' ] ),
-            p[ 'type' ],
-            line_number + 1,
-            int( p[ 'col' ] ),
-            int( p[ 'length' ] ) )
-          for p in vim_props if p.get( 'type', '' ).startswith( 'Ycm' )
-        )
-      return properties
+    return [
+      DiagnosticProperty(
+          int( p[ 'id' ] ),
+          p[ 'type' ],
+          int( p[ 'lnum' ] ),
+          int( p[ 'col' ] ),
+          int( p[ 'length' ] ) )
+      for p in vim.eval(
+          f'prop_list( 1, '
+                       f'{{ "bufnr": { buffer_number }, '
+                           '"end_lnum": -1, '
+                           '"types": [ "YcmErrorProperty", '
+                                      '"YcmWarningProperty" ] } )' ) ]
   else:
     ext_marks = vim.eval(
       f'nvim_buf_get_extmarks( { buffer_number }, '
@@ -259,14 +348,15 @@ def AddTextProperty( buffer_number,
                      line,
                      column,
                      prop_type,
-                     extra_args,
-                     prop_id ):
+                     extra_args ):
   if not VimIsNeovim():
     extra_args.update( {
       'type': prop_type,
-      'bufnr': buffer_number,
-      'id': prop_id } )
-    vim.eval( f'prop_add( { line }, { column }, { extra_args } )' )
+      'bufnr': buffer_number
+    } )
+    return GetIntValue( f'prop_add( { line }, '
+                                  f'{ column }, '
+                                  f'{ json.dumps( extra_args ) } )' )
   else:
     extra_args[ 'hl_group' ] = prop_type
     # Neovim uses 0-based offsets
@@ -276,25 +366,34 @@ def AddTextProperty( buffer_number,
       extra_args[ 'end_col' ] = extra_args.pop( 'end_col' ) - 1
     line -= 1
     column -= 1
-    vim.eval( f'nvim_buf_set_extmark( { buffer_number }, '
-                                    f'{ YCM_NEOVIM_NS_ID }, '
-                                    f'{ line }, '
-                                    f'{ column }, '
-                                    f'{ extra_args } )' )
+    return GetIntValue( f'nvim_buf_set_extmark( { buffer_number }, '
+                                              f'{ YCM_NEOVIM_NS_ID }, '
+                                              f'{ line }, '
+                                              f'{ column }, '
+                                              f'{ extra_args } )' )
 
 
-def RemoveTextProperty( buffer_number: int, prop: DiagnosticProperty ):
+def RemoveDiagnosticProperty( buffer_number: int, prop: DiagnosticProperty ):
+  RemoveTextProperty( buffer_number,
+                      prop.line,
+                      prop.id,
+                      prop.type )
+
+
+def RemoveTextProperty( buffer_number, line_num, prop_id, prop_type ):
   if not VimIsNeovim():
     p = {
-        'bufnr': buffer_number,
-        'id': prop.id,
-        'type': prop.type,
-        'both': 1 }
-    vim.eval( f'prop_remove( { p } )' )
+      'bufnr': buffer_number,
+      'id': prop_id,
+      'type': prop_type,
+      'both': 1,
+      'all': 1
+    }
+    vim.eval( f'prop_remove( { p }, { line_num } )' )
   else:
     vim.eval( f'nvim_buf_del_extmark( { buffer_number }, '
                                     f'{ YCM_NEOVIM_NS_ID }, '
-                                    f'{ prop.id } )' )
+                                    f'{ prop_id } )' )
 
 
 # Clamps the line and column numbers so that they are not past the contents of
@@ -310,7 +409,7 @@ def LineAndColumnNumbersClamped( bufnr, line_num, column_num ):
 
 def SetLocationList( diagnostics ):
   """Set the location list for the current window to the supplied diagnostics"""
-  SetLocationListForWindow( 0, diagnostics )
+  SetLocationListForWindow( vim.current.window, diagnostics )
 
 
 def GetWindowsForBufferNumber( buffer_number ):
@@ -326,49 +425,50 @@ def SetLocationListsForBuffer( buffer_number,
   """Populate location lists for all windows containing the buffer with number
   |buffer_number|. See SetLocationListForWindow for format of diagnostics."""
   for window in GetWindowsForBufferNumber( buffer_number ):
-    SetLocationListForWindow( window.number, diagnostics, open_on_edit )
+    SetLocationListForWindow( window, diagnostics, open_on_edit )
 
 
-def SetLocationListForWindow( window_number,
+def SetLocationListForWindow( window,
                               diagnostics,
                               open_on_edit = False ):
+  window_id = WinIDForWindow( window )
   """Populate the location list with diagnostics. Diagnostics should be in
   qflist format; see ":h setqflist" for details."""
-  ycm_loc_id = vim.windows[ window_number - 1 ].vars.get( 'ycm_loc_id' )
+  ycm_loc_id = window.vars.get( 'ycm_loc_id' )
   # User may have made a bunch of `:lgrep` calls and we do not own the
   # location list with the ID we remember any more.
   if ( ycm_loc_id is not None and
-       vim.eval( f'getloclist( { window_number }, '
+       vim.eval( f'getloclist( { window_id }, '
                                f'{{ "id": { ycm_loc_id }, '
                                 '"title": 0 } ).title' ) == 'ycm_loc' ):
     ycm_loc_id = None
 
   if ycm_loc_id is None:
     # Create new and populate
-    vim.eval( f'setloclist( { window_number }, '
+    vim.eval( f'setloclist( { window_id }, '
                            '[], '
                            '" ", '
                            '{ "title": "ycm_loc", '
                             f'"items": { json.dumps( diagnostics ) } }} )' )
-    vim.windows[ window_number - 1 ].vars[ 'ycm_loc_id' ] = GetIntValue(
-        f'getloclist( { window_number }, {{ "nr": "$", "id": 0 }} ).id' )
+    window.vars[ 'ycm_loc_id' ] = GetIntValue(
+        f'getloclist( { window_id }, {{ "nr": "$", "id": 0 }} ).id' )
   elif open_on_edit:
     # Remove old and create new list
-    vim.eval( f'setloclist( { window_number }, '
+    vim.eval( f'setloclist( { window_id }, '
                            '[], '
                            '"r", '
                           f'{{ "id": { ycm_loc_id }, '
                               '"items": [], "title": "" } )' )
-    vim.eval( f'setloclist( { window_number }, '
+    vim.eval( f'setloclist( { window_id }, '
                            '[], '
                            '" ", '
                            '{ "title": "ycm_loc", '
                             f'"items": { json.dumps( diagnostics ) } }} )' )
-    vim.windows[ window_number - 1 ].vars[ 'ycm_loc_id' ] = GetIntValue(
-        f'getloclist( { window_number }, {{ "nr": "$", "id": 0 }} ).id' )
+    window.vars[ 'ycm_loc_id' ] = GetIntValue(
+        f'getloclist( { window_id }, {{ "nr": "$", "id": 0 }} ).id' )
   else:
     # Just populate the old one
-    vim.eval( f'setloclist( { window_number }, '
+    vim.eval( f'setloclist( { window_id }, '
                            '[], '
                            '"r", '
                           f'{{ "id": { ycm_loc_id }, '
@@ -525,12 +625,13 @@ def TryJumpLocationInTab( tab, filename, line, column ):
     if ComparePaths( GetBufferFilepath( win.buffer ), filename ):
       vim.current.tabpage = tab
       vim.current.window = win
-      vim.current.window.cursor = ( line, column - 1 )
+      if line is not None and column is not None:
+        vim.current.window.cursor = ( line, column - 1 )
+        # Open possible folding at location
+        vim.command( 'normal! zv' )
+        # Center the screen on the jumped-to location
+        vim.command( 'normal! zz' )
 
-      # Open possible folding at location
-      vim.command( 'normal! zv' )
-      # Center the screen on the jumped-to location
-      vim.command( 'normal! zz' )
       return True
   # 'filename' is not opened in this tab page
   return False
@@ -604,12 +705,13 @@ def JumpToLocation( filename, line, column, modifiers, command ):
     if not JumpToFile( filename, command, modifiers ):
       return
 
-  vim.current.window.cursor = ( line, column - 1 )
+  if line is not None and column is not None:
+    vim.current.window.cursor = ( line, column - 1 )
 
-  # Open possible folding at location
-  vim.command( 'normal! zv' )
-  # Center the screen on the jumped-to location
-  vim.command( 'normal! zz' )
+    # Open possible folding at location
+    vim.command( 'normal! zv' )
+    # Center the screen on the jumped-to location
+    vim.command( 'normal! zz' )
 
 
 def NumLinesInBuffer( buffer_object ):
@@ -642,6 +744,7 @@ def PostVimMessage( message, warning = True, truncate = False ):
     vim_width = GetIntValue( '&columns' )
 
     message = message.replace( '\n', ' ' )
+    message = message.replace( '\t', ' ' )
     if len( message ) >= vim_width:
       message = message[ : vim_width - 4 ] + '...'
 
@@ -686,9 +789,9 @@ def PresentDialog( message, choices, default_choice_index = 0 ):
       [Y]es, (N)o, May(b)e:"""
   message = EscapeForVim( ToUnicode( message ) )
   choices = EscapeForVim( ToUnicode( '\n'.join( choices ) ) )
-  to_eval = ( f"confirm('{ message }', "
-                      f"'{ choices }', "
-                      f"{ default_choice_index + 1 })" )
+  to_eval = ( f"confirm( '{ message }', "
+                       f"'{ choices }', "
+                       f"{ default_choice_index + 1 } )" )
   try:
     return GetIntValue( to_eval ) - 1
   except KeyboardInterrupt:
@@ -757,6 +860,16 @@ def EscapeForVim( text ):
   return ToUnicode( text.replace( "'", "''" ) )
 
 
+def AllOpenedFiletypes():
+  """Returns a dict mapping filetype to list of buffer numbers for all open
+  buffers"""
+  filetypes = defaultdict( list )
+  for buffer in vim.buffers:
+    for filetype in FiletypesForBuffer( buffer ):
+      filetypes[ filetype ].append( buffer.number )
+  return filetypes
+
+
 def CurrentFiletypes():
   filetypes = vim.eval( "&filetype" )
   if not filetypes:
@@ -811,7 +924,7 @@ def GetBoolValue( variable ):
 
 
 def GetIntValue( variable ):
-  return int( vim.eval( variable ) )
+  return int( vim.eval( variable ) or 0 )
 
 
 def _SortChunksByFile( chunks ):
@@ -1112,12 +1225,14 @@ def JumpToTab( tab_number ):
   vim.command( f'silent! tabn { tab_number }' )
 
 
-def OpenFileInPreviewWindow( filename ):
+def OpenFileInPreviewWindow( filename, modifiers ):
   """ Open the supplied filename in the preview window """
-  vim.command( 'silent! pedit! ' + filename )
+  if modifiers:
+    modifiers = ' ' + modifiers
+  vim.command( f'silent!{ modifiers } pedit! { filename }' )
 
 
-def WriteToPreviewWindow( message ):
+def WriteToPreviewWindow( message, modifiers ):
   """ Display the supplied message in the preview window """
 
   # This isn't something that comes naturally to Vim. Vim only wants to show
@@ -1129,7 +1244,7 @@ def WriteToPreviewWindow( message ):
 
   ClosePreviewWindow()
 
-  OpenFileInPreviewWindow( vim.eval( 'tempname()' ) )
+  OpenFileInPreviewWindow( vim.eval( 'tempname()' ), modifiers )
 
   if JumpToPreviewWindow():
     # We actually got to the preview window. By default the preview window can't
@@ -1209,7 +1324,7 @@ def OpenFilename( filename, options = {} ):
 
   # Open the file.
   try:
-    vim.command( f'{ options.get( "mods", "") }'
+    vim.command( f'{ options.get( "mods", "" ) }'
                  f'{ size }'
                  f'{ command } '
                  f'{ filename }' )
@@ -1321,20 +1436,14 @@ def VimIsNeovim():
 
 
 @memoize()
-def HasFastPropList():
-  return GetBoolValue( 'has( "patch-8.2.3652" )' )
-
-
-@memoize()
 def VimSupportsPopupWindows():
   return VimHasFunctions( 'popup_create',
+                          'popup_atcursor',
                           'popup_move',
                           'popup_hide',
                           'popup_settext',
                           'popup_show',
-                          'popup_close',
-                          'prop_add',
-                          'prop_type_add' )
+                          'popup_close' )
 
 
 @memoize()

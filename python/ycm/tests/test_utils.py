@@ -35,25 +35,26 @@ from ycmd.utils import GetCurrentDirectory, OnMac, OnWindows, ToUnicode
 
 
 BUFNR_REGEX = re.compile(
-  '^bufnr\\(\'(?P<buffer_filename>.+)\'(, ([01]))?\\)$' )
-BUFWINNR_REGEX = re.compile( '^bufwinnr\\((?P<buffer_number>[0-9]+)\\)$' )
+  '^bufnr\\( \'(?P<buffer_filename>.+)\'(, ([01]))? \\)$' )
+BUFWINNR_REGEX = re.compile( '^bufwinnr\\( (?P<buffer_number>[0-9]+) \\)$' )
 BWIPEOUT_REGEX = re.compile(
   '^(?:silent! )bwipeout!? (?P<buffer_number>[0-9]+)$' )
 GETBUFVAR_REGEX = re.compile(
-  '^getbufvar\\((?P<buffer_number>[0-9]+), "(?P<option>.+)"\\)$' )
+  '^getbufvar\\((?P<buffer_number>[0-9]+), "(?P<option>.+)"\\)( \\?\\? 0)?$' )
+PROP_LIST_REGEX = re.compile(
+        '^prop_list\\( '                       # A literal at the start
+        '(?P<lnum>\\d+), '                     # Start line
+        '{ "bufnr": (?P<bufnr>\\d+), '         # Corresponding buffer number
+        '"end_lnum": (?P<end_lnum>[0-9-]+), '  # End line, can be negative.
+        '"types": (?P<prop_types>\\[.+\\]) } ' # Property types
+        '\\)$' )
 PROP_ADD_REGEX = re.compile(
-        '^prop_add\\( ' # A literal at the start
-        '(?P<start_line>\\d+), ' # First argument - number
+        '^prop_add\\( '            # A literal at the start
+        '(?P<start_line>\\d+), '   # First argument - number
         '(?P<start_column>\\d+), ' # Second argument - number
-        '{'                        # Third argument is a complex dict.
-          '('                        # And some keys are optional.
-            '\'end_lnum\': (?P<end_line>\\d+), '
-            '\'end_col\': (?P<end_column>\\d+), '
-          ')?'                       # End of optional keys
-            '\'type\': \'(?P<type>\\w+)\', '
-            '\'bufnr\': (?P<bufnr>\\d+), '
-            '\'id\': (?P<id>\\d+)'
-        '} \\)$' )
+        '{(?P<opts>.+)} '          # Third argument is a complex dict, which
+                                   # we parse separately
+        '\\)$' )
 PROP_REMOVE_REGEX = re.compile( '^prop_remove\\( (?P<prop>.+) \\)$' )
 OMNIFUNC_REGEX_FORMAT = (
   '^{omnifunc_name}\\((?P<findstart>[01]),[\'"](?P<base>.*)[\'"]\\)$' )
@@ -255,31 +256,32 @@ def _MockVimFunctionsEval( value ):
 
 
 def _MockVimPropEval( value ):
-  match = re.match( 'prop_list\\( (?P<lnum>\\d+), '
-                    '{ "bufnr": (?P<bufnr>\\d+) } \\)', value )
-  if match:
-    return [ p for p in VIM_PROPS_FOR_BUFFER[ int( match.group( 'bufnr' ) ) ]
-             if p.start_line == int( match.group( 'lnum' ) ) ]
+  if match := PROP_LIST_REGEX.search( value ):
+    if int( match.group( 'end_lnum' ) ) == -1:
+      return [ p for p in VIM_PROPS_FOR_BUFFER[ int( match.group( 'bufnr' ) ) ]
+               if p.start_line >= int( match.group( 'lnum' ) ) ]
+    else:
+      return [ p for p in VIM_PROPS_FOR_BUFFER[ int( match.group( 'bufnr' ) ) ]
+               if int( match.group( 'end_lnum' ) ) >= p.start_line and
+                  p.start_line >= int( match.group( 'lnum' ) ) ]
 
-  match = PROP_ADD_REGEX.search( value )
-  if match:
-    prop_type = match.group( 'type' )
+  if match := PROP_ADD_REGEX.search( value ):
     prop_start_line = int( match.group( 'start_line' ) )
     prop_start_column = int( match.group( 'start_column' ) )
-    prop_end_line = match.group( 'end_line' )
-    prop_end_column = match.group( 'end_column' )
+    import ast
+    opts = ast.literal_eval( '{' + match.group( 'opts' ) + '}' )
     vim_prop = VimProp(
-        prop_type,
+        opts[ 'type' ],
         prop_start_line,
         prop_start_column,
-        int( prop_end_line ) if prop_end_line else prop_end_line,
-        int( prop_end_column ) if prop_end_column else prop_end_column )
-    VIM_PROPS_FOR_BUFFER[ int( match.group( 'bufnr' ) ) ].append( vim_prop )
+        int( opts[ 'end_lnum' ] ),
+        int( opts[ 'end_col' ] )
+    )
+    VIM_PROPS_FOR_BUFFER[ int( opts[ 'bufnr' ] ) ].append( vim_prop )
     return vim_prop.id
 
-  match = PROP_REMOVE_REGEX.search( value )
-  if match:
-    prop = eval( match.group( 'prop' ) )
+  if match := PROP_REMOVE_REGEX.search( value ):
+    prop, lin_num = eval( match.group( 'prop' ) )
     vim_props = VIM_PROPS_FOR_BUFFER[ prop[ 'bufnr' ] ]
     for index, vim_prop in enumerate( vim_props ):
       if vim_prop.id == prop[ 'id' ]:
@@ -495,6 +497,26 @@ class VimBuffers:
     return self._buffers.pop( index )
 
 
+class VimTabpages:
+  def __init__( self, *args ):
+    """|buffers| is a list of VimBuffer objects."""
+    self._tabpages = []
+    self._tabpages.extend( args )
+
+
+  def __getitem__( self, number ):
+    """Emulates vim.buffers[ number ]"""
+    for tabpage in self._tabpages:
+      if number == tabpage.number:
+        return tabpage
+    raise KeyError( number )
+
+
+  def __iter__( self ):
+    """Emulates for loop on vim.buffers"""
+    return iter( self._tabpages )
+
+
 class VimWindow:
   """An object that looks like a vim.window object:
     - |number|: number of the window;
@@ -502,7 +524,8 @@ class VimWindow:
       window;
     - |cursor|: a tuple corresponding to the cursor position."""
 
-  def __init__( self, number, buffer_object, cursor = None ):
+  def __init__( self, tabpage, number, buffer_object, cursor = None ):
+    self.tabpage = tabpage
     self.number = number
     self.buffer = buffer_object
     self.cursor = cursor
@@ -516,31 +539,33 @@ class VimWindow:
                         f'cursor = { self.cursor } )' )
 
 
-class VimWindows:
+class VimTabpage:
   """An object that looks like a vim.windows object."""
 
-  def __init__( self, buffers, cursor ):
+  def __init__( self, number, buffers, cursor ):
     """|buffers| is a list of VimBuffer objects corresponding to the window
     layout. The first element of that list is assumed to be the current window.
     |cursor| is the cursor position of that window."""
-    windows = []
-    windows.append( VimWindow( 1, buffers[ 0 ], cursor ) )
+    self.number = number
+    self.windows = []
+    self.windows.append( VimWindow( self, 1, buffers[ 0 ], cursor ) )
     for window_number in range( 1, len( buffers ) ):
-      windows.append( VimWindow( window_number + 1, buffers[ window_number ] ) )
-    self._windows = windows
+      self.windows.append( VimWindow( self,
+                                      window_number + 1,
+                                      buffers[ window_number ] ) )
 
 
   def __getitem__( self, number ):
     """Emulates vim.windows[ number ]"""
     try:
-      return self._windows[ number ]
+      return self.windows[ number ]
     except IndexError:
       raise IndexError( 'no such window' )
 
 
   def __iter__( self ):
     """Emulates for loop on vim.windows"""
-    return iter( self._windows )
+    return iter( self.windows )
 
 
 class VimCurrent:
@@ -550,6 +575,7 @@ class VimCurrent:
   def __init__( self, current_window ):
     self.buffer = current_window.buffer
     self.window = current_window
+    self.tabpage = current_window.tabpage
     self.line = self.buffer.contents[ current_window.cursor[ 0 ] - 1 ]
 
 
@@ -559,8 +585,8 @@ class VimProp:
                 prop_type,
                 start_line,
                 start_column,
-                end_line = None,
-                end_column = None ):
+                end_line,
+                end_column ):
     current_buffer = VIM_MOCK.current.buffer.number
     self.id = len( VIM_PROPS_FOR_BUFFER[ current_buffer ] ) + 1
     self.prop_type = prop_type
@@ -595,6 +621,8 @@ class VimProp:
       return self.start_column
     elif key == 'length':
       return self.end_column - self.start_column
+    elif key == 'lnum':
+      return self.start_line
 
 
   def get( self, key, default = None ):
@@ -645,10 +673,11 @@ def MockVimBuffers( buffers, window_buffers, cursor_position = ( 1, 1 ) ):
                         'which corresponds to the current window.' )
 
   with patch( 'vim.buffers', VimBuffers( buffers ) ):
-    with patch( 'vim.windows', VimWindows( window_buffers,
-                                           cursor_position ) ) as windows:
-      with patch( 'vim.current', VimCurrent( windows[ 0 ] ) ):
-        yield VIM_MOCK
+    with patch( 'vim.tabpages', VimTabpages(
+      VimTabpage( 1, window_buffers, cursor_position ) ) ) as tabpages:
+      with patch( 'vim.windows', tabpages[ 1 ] ) as windows:
+        with patch( 'vim.current', VimCurrent( windows[ 0 ] ) ):
+          yield VIM_MOCK
 
 
 def MockVimModule():

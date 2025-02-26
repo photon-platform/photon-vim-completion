@@ -47,7 +47,7 @@ class CommandTest( TestCase ):
               'extra_conf_data': has_entries( {
                 'tempname()': '_TEMP_FILE_'
               } ),
-            } )
+            } ),
           )
         )
 
@@ -71,7 +71,7 @@ class CommandTest( TestCase ):
                 'tab_size': 2,
                 'insert_spaces': True,
               } )
-            } )
+            } ),
           )
         )
 
@@ -102,7 +102,7 @@ class CommandTest( TestCase ):
                 'column_num': 12
               }
             }
-          }
+          },
         )
 
 
@@ -135,7 +135,7 @@ class CommandTest( TestCase ):
                 'column_num': 9
               }
             }
-          }
+          },
         )
 
 
@@ -148,15 +148,16 @@ class CommandTest( TestCase ):
         '',
         'same-buffer',
         {
+          'completer_target': 'python',
           'options': {
             'tab_size': 2,
             'insert_spaces': True
           },
-        }
+        },
       )
 
       with patch( 'ycm.youcompleteme.SendCommandRequest' ) as send_request:
-        ycm.SendCommandRequest( [ 'ft=ycm:ident', 'GoTo' ], '', False, 1, 1 )
+        ycm.SendCommandRequest( [ 'ft=python', 'GoTo' ], '', False, 1, 1 )
         send_request.assert_called_once_with( *expected_args )
 
       with patch( 'ycm.youcompleteme.SendCommandRequest' ) as send_request:

@@ -18,6 +18,8 @@
 from ycm import vimsupport
 from ycm.client.event_notification import EventNotification
 from ycm.diagnostic_interface import DiagnosticInterface
+from ycm.semantic_highlighting import SemanticHighlighting
+from ycm.inlay_hints import InlayHints
 
 
 # Emulates Vim buffer
@@ -35,12 +37,14 @@ class Buffer:
     self._diag_interface = DiagnosticInterface( bufnr, user_options )
     self._open_loclist_on_ycm_diags = user_options[
                                         'open_loclist_on_ycm_diags' ]
+    self.semantic_highlighting = SemanticHighlighting( bufnr )
+    self.inlay_hints = InlayHints( bufnr )
     self.UpdateFromFileTypes( filetypes )
 
 
   def FileParseRequestReady( self, block = False ):
-    return bool( self._parse_request and
-                 ( block or self._parse_request.Done() ) )
+    return ( bool( self._parse_request ) and
+             ( block or self._parse_request.Done() ) )
 
 
   def SendParseRequest( self, extra_data ):
@@ -58,6 +62,10 @@ class Buffer:
     # reparse on buffer visit and changed tick remains the same.
     self._handled_tick -= 1
     self._parse_tick = self._ChangedTick()
+
+
+  def ParseRequestPending( self ):
+    return bool( self._parse_request ) and not self._parse_request.Done()
 
 
   def NeedsReparse( self ):
@@ -121,6 +129,14 @@ class Buffer:
 
   def RefreshDiagnosticsUI( self ):
     return self._diag_interface.RefreshDiagnosticsUI()
+
+
+  def ClearDiagnosticsUI( self ):
+    return self._diag_interface.ClearDiagnosticsUI()
+
+
+  def DiagnosticsForLine( self, line_number ):
+    return self._diag_interface.DiagnosticsForLine( line_number )
 
 
   def UpdateFromFileTypes( self, filetypes ):

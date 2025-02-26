@@ -5,6 +5,8 @@ function! SetUp()
   let g:ycm_keep_logfiles = 1
   let g:ycm_log_level = 'DEBUG'
   let g:ycm_always_populate_location_list = 1
+  let g:ycm_enable_semantic_highlighting = 1
+  let g:ycm_auto_hover = ''
 
   " diagnostics take ages
   let g:ycm_test_min_delay = 7
@@ -51,7 +53,7 @@ function! Test_Disable_Diagnostics_Update_In_insert_Mode()
 
   " Must do the checks in a timer callback because we need to stay in insert
   " mode until done.
-  function! Check( id ) closure
+  function! CheckNoDiagUIAfterOpenParenthesis( id ) closure
     call WaitForAssert( {->
       \ assert_true(
         \ py3eval(
@@ -60,10 +62,53 @@ function! Test_Disable_Diagnostics_Update_In_insert_Mode()
     call WaitForAssert( {-> assert_false( len( sign_getplaced(
                            \ '%',
                            \ { 'group': 'ycm_signs' } )[ 0 ][ 'signs' ] ) ) } )
-    call feedkeys( "\<ESC>" )
+
+    call FeedAndCheckAgain( "   \<BS>\<BS>\<BS>)",
+      \ funcref( 'CheckNoDiagUIAfterClosingPatenthesis' ) )
   endfunction
 
-  call FeedAndCheckMain( 'imain(', funcref( 'Check' ) )
+  function! CheckNoDiagUIAfterClosingPatenthesis( id ) closure
+    call WaitForAssert( {->
+      \ assert_true(
+        \ py3eval(
+           \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+      \ ) ) } )
+    call WaitForAssert( {-> assert_false( len( sign_getplaced(
+                           \ '%',
+                           \ { 'group': 'ycm_signs' } )[ 0 ][ 'signs' ] ) ) } )
+
+    call feedkeys( "\<ESC>" )
+    call FeedAndCheckAgain( "\<ESC>",
+      \ funcref( 'CheckDiagUIRefreshedAfterLeavingInsertMode' ) )
+  endfunction
+
+  function! CheckDiagUIRefreshedAfterLeavingInsertMode( id ) closure
+    call WaitForAssert( {->
+      \ assert_true(
+        \ py3eval(
+           \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+      \ ) ) } )
+    call WaitForAssert( {-> assert_true( len( sign_getplaced(
+                           \ '%',
+                           \ { 'group': 'ycm_signs' } )[ 0 ][ 'signs' ] ) ) } )
+    call FeedAndCheckAgain( "A\<CR>", funcref( 'CheckNoPropsAfterNewLine' ) )
+  endfunction
+
+  function! CheckNoPropsAfterNewLine( id ) closure
+    call WaitForAssert( {->
+      \ assert_true(
+        \ py3eval(
+           \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+      \ ) ) } )
+    call WaitForAssert( {-> assert_false( len( prop_list(
+                           \ 1, { 'end_lnum': -1,
+                                \ 'types': [ 'YcmVirtDiagWarning',
+                                           \ 'YcmVirtDiagError',
+                                           \ 'YcmVirtDiagPadding' ] } ) ) ) } )
+  endfunction
+
+  call FeedAndCheckMain( 'imain(',
+      \ funcref( 'CheckNoDiagUIAfterOpenParenthesis' ) )
   call test_override( 'ALL', 0 )
 endfunction
 
@@ -77,14 +122,14 @@ function! Test_Changing_Filetype_Refreshes_Diagnostics()
         \ '/test/testdata/diagnostics/foo.xml',
         \ { 'native_ft': 0 } )
 
-  call assert_equal( 'xml', &ft )
+  call assert_equal( 'xml', &filetype )
   call assert_false(
     \ pyxeval( 'ycm_state._buffers[' . bufnr( '%' ) . ']._async_diags' ) )
   call assert_true( empty( sign_getplaced(
                         \ '%',
                         \ { 'group': 'ycm_signs' } )[ 0 ][ 'signs' ] ) )
   setf typescript
-  call assert_equal( 'typescript', &ft )
+  call assert_equal( 'typescript', &filetype )
   call assert_false(
     \ pyxeval( 'ycm_state._buffers[' . bufnr( '%' ) . ']._async_diags' ) )
   " Diagnostics are async, so wait for the assert to return 0 for a while.
@@ -107,7 +152,7 @@ function! Test_MessagePoll_After_LocationList()
     \ '/test/testdata/diagnostics/foo.cpp', {} )
 
   setf cpp
-  call assert_equal( 'cpp', &ft )
+  call assert_equal( 'cpp', &filetype )
   call WaitForAssert( {-> assert_equal( 2, len( sign_getplaced(
                         \ '%',
                         \ { 'group': 'ycm_signs' } )[ 0 ][ 'signs' ] ) ) } )
@@ -158,6 +203,12 @@ function! Test_BufferWithoutAssociatedFile_HighlightingWorks()
                         \ '%',
                         \ { 'group': 'ycm_signs' } )[ 0 ][ 'signs' ] ) ) } )
   let expected_properties = [
+    \ { 'id': 4,
+    \   'col': 1,
+    \   'end': 1,
+    \   'type': 'YcmErrorProperty',
+    \   'length': 0,
+    \   'start': 1 },
     \ { 'id': 3,
     \   'col': 1,
     \   'end': 1,
@@ -165,18 +216,12 @@ function! Test_BufferWithoutAssociatedFile_HighlightingWorks()
     \   'length': 0,
     \   'start': 1 },
     \ { 'id': 2,
-    \   'col': 1,
-    \   'end': 1,
-    \   'type': 'YcmErrorProperty',
-    \   'length': 0,
-    \   'start': 1 },
-    \ { 'id': 1,
     \    'col': 1,
     \    'end': 1,
     \    'type': 'YcmErrorProperty',
     \    'length': 4,
     \    'start': 1 },
-    \ { 'id': 0,
+    \ { 'id': 1,
     \    'col': 1,
     \    'end': 1,
     \    'type': 'YcmErrorProperty',
@@ -194,4 +239,228 @@ function! Test_ThirdPartyDeletesItsTextProperty()
 
   py3 from ycm.vimsupport import GetTextProperties, GetIntValue
   call assert_equal( [], py3eval( 'GetTextProperties( GetIntValue( """bufnr( "%" )""" ) )' ) )
+endfunction
+
+function! Test_ShowDetailedDiagnostic_CmdLine()
+  call youcompleteme#test#setup#OpenFile(
+    \ '/test/testdata/cpp/fixit.cpp', {} )
+
+  call cursor( [ 3, 1 ] )
+  redir => output
+  YcmShowDetailedDiagnostic
+  redir END
+
+  call assert_equal(
+        \ "Format specifies type 'char *' but the argument has type 'int' "
+        \ . '(fix available) [-Wformat]',
+        \ trim( output ) )
+
+  %bwipe!
+endfunction
+
+function! Test_ShowDetailedDiagnostic_PopupAtCursor()
+  call youcompleteme#test#setup#OpenFile(
+    \ '/test/testdata/cpp/fixit.cpp', {} )
+
+  call cursor( [ 3, 1 ] )
+  YcmShowDetailedDiagnostic popup
+
+  let id = popup_locate( 4, 16 )
+  call assert_notequal(
+        \ 0,
+        \ id,
+        \ "Couldn't find popup! " .. youcompleteme#test#popup#DumpPopups() )
+
+  if exists( '*popup_list' )
+    let popups = popup_list()
+    call assert_equal( 1, len( popups ) )
+  endif
+
+  call youcompleteme#test#popup#CheckPopupPosition( id, {
+        \ 'visible': 1,
+        \ 'col': 16,
+        \ 'line': 4,
+        \ } )
+  call assert_equal(
+        \ [
+        \   "Format specifies type 'char *' but the argument has type 'int' "
+        \   . '(fix available) [-Wformat]',
+        \ ],
+        \ getbufline( winbufnr(id), 1, '$' ) )
+
+  " From vim's test_popupwin.vim
+  " trigger the check for last_cursormoved by going into insert mode
+  call test_override( 'char_avail', 1 )
+  call feedkeys( "ji\<Esc>", 'xt' )
+  call assert_equal( {}, popup_getpos( id ) )
+  call test_override( 'ALL', 0 )
+
+  %bwipe!
+endfunction
+
+function! Test_ShowDetailedDiagnostic_Popup_WithCharacters()
+  let f = tempname() . '.cc'
+  execut 'edit' f
+  call setline( 1, [
+        \   'struct Foo {};',
+        \   'template<char...> Foo operator""_foo() { return {}; }',
+        \   'int main() {',
+        \       '""_foo',
+        \   '}',
+        \ ] )
+  call youcompleteme#test#setup#WaitForInitialParse( {} )
+
+  call WaitForAssert( {->
+    \ assert_true(
+      \ py3eval(
+         \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+    \ ) ) } )
+
+  call cursor( [ 4, 1 ] )
+  YcmShowDetailedDiagnostic popup
+
+  let id = popup_locate( 5, 7 )
+  call assert_notequal(
+        \ 0,
+        \ id,
+        \ "Couldn't find popup! " .. youcompleteme#test#popup#DumpPopups() )
+
+  if exists( '*popup_list' )
+    let popups = popup_list()
+    call assert_equal( 1, len( popups ) )
+  endif
+
+  call youcompleteme#test#popup#CheckPopupPosition( id, {
+        \ 'visible': 1,
+        \ 'col': 7,
+        \ 'line': 5,
+        \ } )
+  call assert_match(
+        \ "^No matching literal operator for call to 'operator\"\"_foo'.*",
+        \ getbufline( winbufnr(id), 1, '$' )[ 0 ] )
+
+  " From vim's test_popupwin.vim
+  " trigger the check for last_cursormoved by going into insert mode
+  call test_override( 'char_avail', 1 )
+  call feedkeys( "ji\<Esc>", 'xt' )
+  call assert_equal( {}, popup_getpos( id ) )
+  call test_override( 'ALL', 0 )
+
+  %bwipe!
+endfunction
+
+function! Test_ShowDetailedDiagnostic_Popup_MultilineDiagNotFromStartOfLine()
+  let f = tempname() . '.cc'
+  execut 'edit' f
+  call setline( 1, [
+        \   'int main () {',
+        \   '  int a \',
+        \   '=\',
+        \   '=',
+        \   '3;',
+        \   '}',
+        \ ] )
+  call youcompleteme#test#setup#WaitForInitialParse( {} )
+
+  call WaitForAssert( {->
+    \ assert_true(
+      \ py3eval(
+         \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+    \ ) ) } )
+
+  call test_override( 'char_avail', 1 )
+
+  for cursor_pos in [ [ 2, 9 ], [ 3, 1], [ 4, 1 ] ]
+    call cursor( cursor_pos )
+    YcmShowDetailedDiagnostic popup
+
+    call assert_equal( len( popup_list() ), 1 )
+    let id = popup_list()[ 0 ]
+    call assert_notequal( 0, id, "Couldn't find popup!" )
+    call assert_equal( [ 3, 10 ], win_screenpos( id ) )
+
+    call youcompleteme#test#popup#CheckPopupPosition( id, {
+          \ 'visible': 1,
+          \ 'col': 10,
+          \ 'line': 3,
+          \ } )
+    call assert_match(
+          \ "^Invalid '==' at end of declaration; did you mean '='?.*",
+          \ getbufline( winbufnr(id), 1, '$' )[ 0 ] )
+    " From vim's test_popupwin.vim
+    " trigger the check for last_cursormoved by going into insert mode
+    call feedkeys( "ji\<Esc>", 'xt' )
+    call assert_equal( {}, popup_getpos( id ) )
+  endfor
+
+  call test_override( 'ALL', 0 )
+
+  %bwipe!
+endfunction
+
+function! Test_ShowDetailedDiagnostic_Popup_MultilineDiagFromStartOfLine()
+  let f = tempname() . '.cc'
+  execut 'edit' f
+  call setline( 1, [
+        \   'int main () {',
+        \   'const int &&',
+        \   '        /* */',
+        \   '    rd = 1;',
+        \   'rd = 4;',
+        \   '}',
+        \ ] )
+  call youcompleteme#test#setup#WaitForInitialParse( {} )
+
+  call WaitForAssert( {->
+    \ assert_true(
+      \ py3eval(
+         \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+    \ ) ) } )
+
+  call test_override( 'char_avail', 1 )
+
+  for cursor_pos in [ [ 2, 1 ], [ 3, 9 ], [ 4, 5 ] ]
+    call cursor( cursor_pos )
+    YcmShowDetailedDiagnostic popup
+
+    call assert_equal( 1, len( popup_list() ) )
+    let id = popup_list()[ 0 ]
+    call assert_notequal( 0, id, "Couldn't find popup!" )
+    call assert_equal( [ 3, 13 ], win_screenpos( id ) )
+
+    call youcompleteme#test#popup#CheckPopupPosition( id, {
+          \ 'visible': 1,
+          \ 'col': 13,
+          \ 'line': 3,
+          \ } )
+    call assert_match(
+          \ "^Variable 'rd' declared const here.*",
+          \ getbufline( winbufnr(id), 1, '$' )[ 0 ] )
+    " From vim's test_popupwin.vim
+    " trigger the check for last_cursormoved by going into insert mode
+    call feedkeys( "ji\<Esc>ki\<Esc>", 'xt' )
+    call assert_equal( {}, popup_getpos( id ) )
+  endfor
+
+  call test_override( 'ALL', 0 )
+
+  %bwipe!
+endfunction
+
+function! Test_ShowDetailedDiagnostic_Popup_MultipleDiagsPerLine_SameMessage()
+  let f = tempname() . '.cc'
+  execut 'edit' f
+  call setline( 1, [ 'void f(){a;a;}', ] )
+  call youcompleteme#test#setup#WaitForInitialParse( {} )
+
+  call WaitForAssert( {->
+    \ assert_true(
+      \ py3eval(
+        \ 'len( ycm_state.CurrentBuffer()._diag_interface._diagnostics )'
+    \ ) ) } )
+
+  YcmShowDetailedDiagnostic popup
+  let popup_list = popup_list()
+  call assert_equal( 1, len( popup_list ) )
+  call popup_close( popup_list[ 0 ] )
 endfunction
